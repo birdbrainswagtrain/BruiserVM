@@ -150,7 +150,7 @@ end
 local function xchg_reg_16(pc)
     local other_reg = "r16["..bit.band(7,mem8[pc]).."]"
     return {
-        code="local tmp=r16[0] ; r16[0]="..other_reg.." ; "..other_reg.."=tmp",
+        code="do local tmp=r16[0] ; r16[0]="..other_reg.." ; "..other_reg.."=tmp end",
         len=1
     }
 end
@@ -457,13 +457,13 @@ local op_handlers = {
     end,
     [0xE4]=function(pc)
         return {
-            code="r8[0]=in("..mem8[pc+1]..")",
+            code="r8[0]=cpu.input("..mem8[pc+1]..")",
             len=2
         }
     end,
     [0xE6]=function(pc)
         return {
-            code="out("..mem8[pc+1]..",r8[0])",
+            code="cpu.output("..mem8[pc+1]..",r8[0])",
             len=2
         }
     end,
@@ -492,7 +492,7 @@ local op_handlers = {
 
         if reg==4 then
             return {
-                code="r16[0]=r8[0]*"..rm.." -------------- TODO SET OF AND CF IF ANY BITS IN UPPER HALF ARE SET",
+                code="r16[0]=r8[0]*"..rm.." ; cpu.f_carry = bit.band(0xFF00,r16[0])~=0 ; cpu.f_overflow = cpu.f_carry",
                 len=1+len
             }
         else
@@ -505,7 +505,7 @@ local op_handlers = {
         if reg==6 then
             -- divide, TODO errors
             return {
-                code="local tmp1=r16[0]+r16[2]*256 ; local tmp2="..rm.." ; r16[0]=math.floor(tmp1/tmp2) ; r16[2]=tmp1%tmp2",
+                code="do local tmp1=r16[0]+r16[2]*256 ; local tmp2="..rm.." ; r16[0]=math.floor(tmp1/tmp2) ; r16[2]=tmp1%tmp2 end",
                 len=1+len
             }
         else
@@ -532,7 +532,7 @@ local op_handlers = {
 
         if reg==0 then
             return {
-                code="local tmp = cpu.f_carry ; "..rm.."=status("..rm.."+1,16) ; cpu.f_carry = tmp",
+                code="do local tmp = cpu.f_carry ; "..rm.."=status("..rm.."+1,16) ; cpu.f_carry = tmp end",
                 len=1+len
             }
         else
@@ -543,7 +543,8 @@ local op_handlers = {
 }
 
 local instructions = {}
-local pc=0x7C00
+local func_entry=0x7C00
+local pc=func_entry
 local error_msgs = {}
 
 local jmp_addrs = {}
@@ -586,7 +587,7 @@ while jmp_addr ~= nil do
     jmp_addr = next(jmp_addrs)
 end
 
-local min_addr = 9999999999
+local min_addr = math.huge
 local max_addr = 0
 
 for addr,_ in pairs(instructions) do
@@ -616,7 +617,193 @@ for addr=min_addr,max_addr do
     end
 end
 
-PrintTable(jmp_addrs)
 
 print("\nERRORS:")
 PrintTable(error_msgs)
+
+-- create blocks
+local function make_block()
+    return {xrefs={},loops=0,min_loop_target=math.huge}
+end
+
+local blocks = {[func_entry]=make_block()}
+blocks[func_entry].entry = true
+for addr,instr in pairs(instructions) do
+    if instr.jmp_addr and not blocks[instr.jmp_addr] then
+        blocks[instr.jmp_addr]= make_block()
+    end
+end
+
+-- fill blocks with instrucitons
+for addr,block in pairs(blocks) do
+    repeat
+        if blocks[addr] and blocks[addr]~=block then
+            -- entry point shouldn't get linked to anything
+            block.next_addr=addr
+            break
+        end
+        local instr = instructions[addr]
+        if instr == nil then break end
+        table.insert(block,instr)
+        addr = addr+instr.len
+    until instr.len==0
+end
+
+-- build sorted addr list
+local block_addrs = {}
+for addr,block in pairs(blocks) do
+    table.insert(block_addrs,addr)
+end
+table.sort(block_addrs)
+while block_addrs[1]<func_entry do
+    local addr = table.remove(block_addrs, 1)
+    table.insert(block_addrs, addr)
+    error("REORDER BLOCK,ENTRY JUMP SHOULD BE HANDED ALREADY")
+end
+
+-- build linkage
+local last_addr
+for i,addr in pairs(block_addrs) do
+    local block = blocks[addr]
+    if last_addr then
+        blocks[last_addr].next = addr
+        blocks[addr].prev = last_addr
+    end
+    last_addr = addr
+end
+
+-- patch up any adjacent blocks that were separated
+for addr,block in pairs(blocks) do
+    if block.next_addr and block.next_addr ~= block.next then
+        error("BLOCK JUMP FIXUP")
+        table.insert(block,{jmp_addr=block.next_addr,len=0})
+    end
+end
+
+-- find xrefs
+local current_id = 0
+local block_addr = func_entry
+while block_addr ~= nil do
+    local block = blocks[block_addr]
+    block.base_id = current_id+1
+    
+    for i=1,#block do
+        local instr = block[i]
+        instr.id = current_id+i
+        if instr.jmp_addr then
+            blocks[instr.jmp_addr].xrefs[instr.id]=true
+        end
+    end
+    
+    current_id=current_id+#block
+    block_addr=block.next
+end
+
+local function check_can_loop(source_block,source_id,target_id)
+    local block=source_block
+
+    print("POTENTIAL LOOP:",source_id,target_id)
+    while true do
+        for xref,_ in pairs(block.xrefs) do
+            if xref>source_id or xref<target_id then
+                print("BAD",xref)
+                return false
+            end
+        end
+        if block.min_loop_target and block.min_loop_target<target_id then
+            print("BAD (COLLISION)") -- TODO I HAVE NO IDEA IF THIS ACTUALLY WORKS
+            return false
+        end
+        if target_id==block.base_id then break end
+        block=blocks[block.prev]
+    end
+    block.loops=block.loops+1
+    source_block.min_loop_target = math.min(target_id,block.min_loop_target)
+
+    print("GOOD")
+    return true
+end
+
+-- build loops - finally
+local block_addr = func_entry
+while block_addr ~= nil do
+    local block = blocks[block_addr]
+
+    for i=1,#block do
+        local instr = block[i]
+        if instr.jmp_addr then
+            local target_id = blocks[instr.jmp_addr].base_id
+
+            if instr.id >= target_id and check_can_loop(block,instr.id,target_id) then
+                instr.loop=true
+            else
+                blocks[instr.jmp_addr].needs_label=true
+            end
+        end
+    end
+
+    block_addr=block.next
+end
+
+print("\nBLOCKS:")
+PrintTable(blocks)
+
+-- codegen
+local code_lines={
+    "return function(cpu)",
+        "local call=cpu.call",
+        "local int=cpu.int",
+        "local status=cpu.status",
+        "local r8=cpu.r8",
+        "local r16=cpu.r16",
+        "local data8=cpu.data8",
+        "local data16=cpu.data16",
+        "local stack8=cpu.stack8",
+        "local stack16=cpu.stack16",
+        "--todo cache all locals from cpu"
+}
+
+local block_addr = func_entry
+while block_addr ~= nil do
+    local block = blocks[block_addr]
+
+    if block.needs_label then
+        table.insert(code_lines,string.format("::L%x::",block_addr))
+    end
+
+    print(block.loops)
+    for i=1,block.loops do
+        table.insert(code_lines,"repeat")
+    end
+
+    for i=1,#block do
+        local instr = block[i]
+        if instr.code then
+            table.insert(code_lines,instr.code)
+        end
+        if instr.loop then
+            if instr.jmp_cond then
+                table.insert(code_lines,"until not "..instr.jmp_cond)
+            else
+                table.insert(code_lines,"until false")
+            end
+        elseif instr.jmp_addr then
+            if instr.jmp_cond then
+                table.insert(code_lines,string.format("if %s then goto L%x end",instr.jmp_cond,instr.jmp_addr))
+            else
+                table.insert(code_lines,string.format("goto L%x",instr.jmp_addr))
+            end
+        end
+    end
+
+    block_addr=block.next
+end
+
+table.insert(code_lines,"end")
+
+local code_str = table.concat(code_lines,"\n")
+
+print(code_str)
+file.Write("glua86/code.txt", code_str)
+
+local code_f = CompileString(code_str, "glua86")()
