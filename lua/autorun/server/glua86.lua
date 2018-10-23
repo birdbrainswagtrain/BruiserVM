@@ -10,9 +10,11 @@ end
 
 local mem8 = setmetatable({},{
     __index=function(t,i)
+        i = bit.band(i,0xFFFFF) -- clamp to 20 bits for now
         return bit.band(0xFF,bit.rshift(mem_raw[bit.rshift(i,2)],bit.band(i,3)*8))
     end,
     __newindex=function(t,i,v)
+        i = bit.band(i,0xFFFFF) -- clamp to 20 bits for now
         local mask = bit.bnot(bit.lshift(0xFF,bit.band(i,3)*8))
         mem_raw[bit.rshift(i,2)] = 
             bit.band(mem_raw[bit.rshift(i,2)],mask) +
@@ -23,6 +25,10 @@ local mem8 = setmetatable({},{
 local mem16 = setmetatable({},{
     __index=function(t,i)
         return mem8[i]+mem8[i+1]*256
+    end,
+    __newindex=function(t,i,v)
+        mem8[i] = v
+        mem8[i+1] = bit.rshift(v,8)
     end
 })
 
@@ -45,16 +51,135 @@ end
     print(string.format("%x %x %x",mem_raw[i],mem8[i*4],mem8[i*4+1]))
 end]]
 
+local regs={[0]=0,0,0,0,65534,0,0,0}
+
+local r16 = setmetatable({},{
+    __index=function(t,i)
+        return regs[i]
+    end,
+    __newindex=function(t,i,v)
+        regs[i] = bit.band(0xFFFF,v)
+    end
+})
+
+local r8 = setmetatable({},{
+    __index=function(t,i)
+        if i<4 then
+            return bit.band(0xFF,regs[i])
+        else
+            return bit.band(0xFF, bit.rshift(regs[i-4],8) )
+        end
+    end,
+    __newindex=function(t,i,v)
+        if i<4 then
+            regs[i] = bit.band(0xFFFFFF00,regs[i]) + bit.band(0xFF,v)
+        else
+            regs[i-4] = bit.band(0xFFFF00FF,regs[i-4]) + bit.band(0xFF,v)*256
+        end
+    end
+})
+
+
+local width_masks = {
+    [8]=0xFF,
+    [16]=0xFFFF
+}
+
+local width_signbits = {
+    [8]=0x10,
+    [16]=0x1000
+}
+
+local width_carrybits = {
+    [8]=0x100,
+    [16]=0x10000
+}
+
+local seg_offsets={0,0,0,0,0,0}
+
 local cpu = {
-    mem8 = mem8,
-    mem16 = mem16,
     f_dir = 1,
+    f_zero = false,
+    f_sign = false,
+    f_carry = false,
+    f_overflow = false,
+
     get_flags = nil,
     set_flags = nil,
-    r8 = nil,
-    r16 = nil,
-    seg = nil
+    r8 = r8,
+    r16 = r16,
+
+    seg_offsets=seg_offsets,
+
+    int=function(n)
+        print("INT "..n)
+        print("REGS:")
+        PrintTable(regs)
+    end
 }
+
+local loop_count=0
+function cpu.yeild()
+    loop_count=loop_count+1
+    print("L00PS:",loop_count)
+    return false
+end
+
+function cpu.status(x,width)
+
+    cpu.f_zero = bit.band(x,width_masks[width])==0
+    cpu.f_sign = bit.band(x,width_signbits[width])~=0
+    cpu.f_carry = bit.band(x,width_carrybits[width])~=0
+    cpu.f_overflow = 0
+
+    return x
+end
+
+function get_segment_view(seg_n)
+    -- memory access can wrap over the top of real address space
+    -- but NOT over the end of segments
+
+    local seg8 = setmetatable({},{
+        __index=function(t,i)
+            local addr = bit.band(i, 0xFFFF)
+            local real_addr = seg_offsets[seg_n] + addr
+            return mem8[ real_addr ]
+        end,
+        __newindex=function(t,i,v)
+            local addr = bit.band(i, 0xFFFF)
+            local real_addr = seg_offsets[seg_n] + addr
+            mem8[ real_addr ] = v
+        end
+    })
+
+    local seg16 = setmetatable({},{
+        __index=function(t,i)
+            local addr = bit.band(i, 0xFFFF)
+            if addr == 0xFFFF then error("GP") end
+            local real_addr = seg_offsets[seg_n] + addr
+            return mem16[ real_addr ]
+        end,
+        __newindex=function(t,i,v)
+            local addr = bit.band(i, 0xFFFF)
+            if addr == 0xFFFF then error("GP") end
+            local real_addr = seg_offsets[seg_n] + addr
+            mem16[ real_addr ] = v
+        end
+    })
+
+    return seg8, seg16
+end
+
+cpu.seg_e8, cpu.seg_e16 = get_segment_view(0)
+cpu.code8, cpu.code16 =   get_segment_view(1)
+cpu.stack8, cpu.stack16 = get_segment_view(2)
+cpu.data8, cpu.data16 =   get_segment_view(3)
+
+cpu.call=function(n)
+    print("CALL "..n)
+    print("REGS:")
+    PrintTable(regs)
+end
 
 local function get_seg(i)
     local seg_lut = {
@@ -77,17 +202,17 @@ local function modrm(pc,reg_type,width)
     local reg_result
     
     if reg_type then
-        if reg_type=="seg" then
-            reg_result = get_seg(reg)..".offset"
-        else
-            reg_result = reg_type.."["..reg.."]"
-        end
+        reg_result = reg_type.."["..reg.."]"
     else
         reg_result=reg
     end
 
+    local seg_name = get_seg(3)
+
+    local byte_width = width/8
+
     if mod==0 and rm==6 then
-        return reg_result,"data"..width.."["..mem16[pc+1].."]",3
+        return reg_result, seg_name..width.."["..mem16[pc+1].."]",3
     elseif mod==3 then
         return reg_result, "r"..width.."["..rm.."]",1
     else
@@ -110,9 +235,9 @@ local function modrm(pc,reg_type,width)
         local rm_result = "-------------------------->bad"..rm
 
         if rm==0 then
-            rm_result = "data"..width.."[r16[3]+r16[6]"..offset.."]"
+            rm_result = seg_name..width.."[r16[3]+r16[6]"..offset.."]"
         elseif rm==5 then
-            rm_result = "data"..width.."[r16[7]"..offset.."]"
+            rm_result = seg_name..width.."[r16[7]"..offset.."]"
         end
 
         return reg_result,rm_result,len
@@ -317,7 +442,7 @@ local op_handlers = {
         }
     end,
     [0x8E]=function(pc)
-        local reg,rm,len = modrm(pc+1,"seg",16)
+        local reg,rm,len = modrm(pc+1,"cpu.seg_offsets",16)
         return {
             code=reg.."="..rm.."*16",
             len=1+len
@@ -335,14 +460,14 @@ local op_handlers = {
 
     [0x9C]=function(pc)
         return {
-            code="r16[4]=r16[4]-2 ; stack16[r16[4]] = cpu.get_flags()",
+            code="r16[4]=r16[4]-2 ; data16[r16[4]] = cpu.get_flags()",
             len=1
         }
     end,
     
     [0x9D]=function(pc)
         return {
-            code="cpu.set_flags(stack16[r16[4]]) ; r16[4]=r16[4]+2",
+            code="cpu.set_flags(data16[r16[4]]) ; r16[4]=r16[4]+2",
             len=1
         }
     end,
@@ -379,13 +504,13 @@ local op_handlers = {
     -- stos
     [0xAA]=function(pc)
         return {
-            code="cpu.seg_e[r16[7]]=r16[0] ; r16[7]=r16[7]+cpu.f_dir",
+            code="cpu.seg_e16[r16[7]]=r16[0] ; r16[7]=r16[7]+cpu.f_dir",
             len=1
         }
     end,
     [0xAB]=function(pc)
         return {
-            code="cpu.seg_e[r16[7]]=r16[0] ; r16[7]=r16[7]+2*cpu.f_dir",
+            code="cpu.seg_e16[r16[7]]=r16[0] ; r16[7]=r16[7]+2*cpu.f_dir",
             len=1
         }
     end,
@@ -542,268 +667,291 @@ local op_handlers = {
     end
 }
 
-local instructions = {}
-local func_entry=0x7C00
-local pc=func_entry
-local error_msgs = {}
 
-local jmp_addrs = {}
+local function compile_func(func_entry)
+    local instructions = {}
+    local func_entry=0x7C00
+    local pc=func_entry
+    local error_msgs = {}
 
-::compile_chunk::
-while true do
-    local op = mem8[pc]
+    local jmp_addrs = {}
 
-    local handler = op_handlers[op]
+    ::compile_chunk::
+    while true do
+        local op = mem8[pc]
 
-    if handler then
-        local instr = handler(pc)
-        instructions[pc] = instr
-        if instr.jmp_addr then
-            jmp_addrs[instr.jmp_addr]=true
-        end
-        if instr.len==0 then
+        local handler = op_handlers[op]
+
+        if handler then
+            local instr = handler(pc)
+            instructions[pc] = instr
+            if instr.jmp_addr then
+                jmp_addrs[instr.jmp_addr]=true
+            end
+            if instr.len==0 then
+                break
+            end
+            if instr.len==nil then
+                table.insert(error_msgs,string.format("%x: no len %x",pc,op))
+                break
+            end
+            pc=pc+instr.len
+        else
+            table.insert(error_msgs,string.format("%x: unknown opcode %x",pc,op))
             break
         end
-        if instr.len==nil then
-            table.insert(error_msgs,string.format("%x: no len %x",pc,op))
-            break
-        end
-        pc=pc+instr.len
-    else
-        table.insert(error_msgs,string.format("%x: unknown opcode %x",pc,op))
-        break
-    end
-end
-
-local jmp_addr = next(jmp_addrs)
-while jmp_addr ~= nil do
-    jmp_addrs[jmp_addr]=nil
-    
-    if instructions[jmp_addr] == nil then
-        pc = jmp_addr
-        goto compile_chunk
     end
 
-    jmp_addr = next(jmp_addrs)
-end
-
-local min_addr = math.huge
-local max_addr = 0
-
-for addr,_ in pairs(instructions) do
-    min_addr=math.min(addr,min_addr)
-    max_addr=math.max(addr,max_addr)
-end
-
-local next_addr=min_addr
-for addr=min_addr,max_addr do
-    local instr = instructions[addr]
-    if instr then
-        if next_addr~=addr then
-            print("-----------------------------------------------------------")
+    local jmp_addr = next(jmp_addrs)
+    while jmp_addr ~= nil do
+        jmp_addrs[jmp_addr]=nil
+        
+        if instructions[jmp_addr] == nil then
+            pc = jmp_addr
+            goto compile_chunk
         end
 
-        local str = instr.code or ""
-        if instr.jmp_addr then
-            str=str.." -- goto "..string.format("%x",instr.jmp_addr)
-            if instr.jmp_cond then
-                str=str.." if "..instr.jmp_cond
+        jmp_addr = next(jmp_addrs)
+    end
+
+    local min_addr = math.huge
+    local max_addr = 0
+
+    for addr,_ in pairs(instructions) do
+        min_addr=math.min(addr,min_addr)
+        max_addr=math.max(addr,max_addr)
+    end
+
+    local next_addr=min_addr
+    for addr=min_addr,max_addr do
+        local instr = instructions[addr]
+        if instr then
+            if next_addr~=addr then
+                print("-----------------------------------------------------------")
+            end
+
+            local str = instr.code or ""
+            if instr.jmp_addr then
+                str=str.." -- goto "..string.format("%x",instr.jmp_addr)
+                if instr.jmp_cond then
+                    str=str.." if "..instr.jmp_cond
+                end
+            end
+
+            next_addr=addr+instr.len
+
+            print(string.format("%x",addr),str)
+        end
+    end
+
+
+    print("\nERRORS:")
+    PrintTable(error_msgs)
+
+    -- create blocks
+    local function make_block()
+        return {xrefs={},loops=0,min_loop_target=math.huge}
+    end
+
+    local blocks = {[func_entry]=make_block()}
+    blocks[func_entry].entry = true
+    for addr,instr in pairs(instructions) do
+        if instr.jmp_addr and not blocks[instr.jmp_addr] then
+            blocks[instr.jmp_addr]= make_block()
+        end
+    end
+
+    -- fill blocks with instrucitons
+    for addr,block in pairs(blocks) do
+        repeat
+            if blocks[addr] and blocks[addr]~=block then
+                -- entry point shouldn't get linked to anything
+                block.next_addr=addr
+                break
+            end
+            local instr = instructions[addr]
+            if instr == nil then break end
+            table.insert(block,instr)
+            addr = addr+instr.len
+        until instr.len==0
+    end
+
+    -- build sorted addr list
+    local block_addrs = {}
+    for addr,block in pairs(blocks) do
+        table.insert(block_addrs,addr)
+    end
+    table.sort(block_addrs)
+    while block_addrs[1]<func_entry do
+        local addr = table.remove(block_addrs, 1)
+        table.insert(block_addrs, addr)
+        error("REORDER BLOCK,ENTRY JUMP SHOULD BE HANDED ALREADY")
+    end
+
+    -- build linkage
+    local last_addr
+    for i,addr in pairs(block_addrs) do
+        local block = blocks[addr]
+        if last_addr then
+            blocks[last_addr].next = addr
+            blocks[addr].prev = last_addr
+        end
+        last_addr = addr
+    end
+
+    -- patch up any adjacent blocks that were separated
+    for addr,block in pairs(blocks) do
+        if block.next_addr and block.next_addr ~= block.next then
+            error("BLOCK JUMP FIXUP")
+            table.insert(block,{jmp_addr=block.next_addr,len=0})
+        end
+    end
+
+    -- find xrefs
+    local current_id = 0
+    local block_addr = func_entry
+    while block_addr ~= nil do
+        local block = blocks[block_addr]
+        block.base_id = current_id+1
+        
+        for i=1,#block do
+            local instr = block[i]
+            instr.id = current_id+i
+            if instr.jmp_addr then
+                blocks[instr.jmp_addr].xrefs[instr.id]=true
             end
         end
-
-        next_addr=addr+instr.len
-
-        print(string.format("%x",addr),str)
+        
+        current_id=current_id+#block
+        block_addr=block.next
     end
-end
 
+    local function check_can_loop(source_block,source_id,target_id)
+        local block=source_block
 
-print("\nERRORS:")
-PrintTable(error_msgs)
-
--- create blocks
-local function make_block()
-    return {xrefs={},loops=0,min_loop_target=math.huge}
-end
-
-local blocks = {[func_entry]=make_block()}
-blocks[func_entry].entry = true
-for addr,instr in pairs(instructions) do
-    if instr.jmp_addr and not blocks[instr.jmp_addr] then
-        blocks[instr.jmp_addr]= make_block()
-    end
-end
-
--- fill blocks with instrucitons
-for addr,block in pairs(blocks) do
-    repeat
-        if blocks[addr] and blocks[addr]~=block then
-            -- entry point shouldn't get linked to anything
-            block.next_addr=addr
-            break
-        end
-        local instr = instructions[addr]
-        if instr == nil then break end
-        table.insert(block,instr)
-        addr = addr+instr.len
-    until instr.len==0
-end
-
--- build sorted addr list
-local block_addrs = {}
-for addr,block in pairs(blocks) do
-    table.insert(block_addrs,addr)
-end
-table.sort(block_addrs)
-while block_addrs[1]<func_entry do
-    local addr = table.remove(block_addrs, 1)
-    table.insert(block_addrs, addr)
-    error("REORDER BLOCK,ENTRY JUMP SHOULD BE HANDED ALREADY")
-end
-
--- build linkage
-local last_addr
-for i,addr in pairs(block_addrs) do
-    local block = blocks[addr]
-    if last_addr then
-        blocks[last_addr].next = addr
-        blocks[addr].prev = last_addr
-    end
-    last_addr = addr
-end
-
--- patch up any adjacent blocks that were separated
-for addr,block in pairs(blocks) do
-    if block.next_addr and block.next_addr ~= block.next then
-        error("BLOCK JUMP FIXUP")
-        table.insert(block,{jmp_addr=block.next_addr,len=0})
-    end
-end
-
--- find xrefs
-local current_id = 0
-local block_addr = func_entry
-while block_addr ~= nil do
-    local block = blocks[block_addr]
-    block.base_id = current_id+1
-    
-    for i=1,#block do
-        local instr = block[i]
-        instr.id = current_id+i
-        if instr.jmp_addr then
-            blocks[instr.jmp_addr].xrefs[instr.id]=true
-        end
-    end
-    
-    current_id=current_id+#block
-    block_addr=block.next
-end
-
-local function check_can_loop(source_block,source_id,target_id)
-    local block=source_block
-
-    print("POTENTIAL LOOP:",source_id,target_id)
-    while true do
-        for xref,_ in pairs(block.xrefs) do
-            if xref>source_id or xref<target_id then
-                print("BAD",xref)
+        print("POTENTIAL LOOP:",source_id,target_id)
+        while true do
+            for xref,_ in pairs(block.xrefs) do
+                if xref>source_id or xref<target_id then
+                    print("BAD",xref)
+                    return false
+                end
+            end
+            if block.min_loop_target and block.min_loop_target<target_id then
+                print("BAD (COLLISION)") -- TODO I HAVE NO IDEA IF THIS ACTUALLY WORKS
                 return false
             end
+            if target_id==block.base_id then break end
+            block=blocks[block.prev]
         end
-        if block.min_loop_target and block.min_loop_target<target_id then
-            print("BAD (COLLISION)") -- TODO I HAVE NO IDEA IF THIS ACTUALLY WORKS
-            return false
-        end
-        if target_id==block.base_id then break end
-        block=blocks[block.prev]
+        block.loops=block.loops+1
+        source_block.min_loop_target = math.min(target_id,block.min_loop_target)
+
+        print("GOOD")
+        return true
     end
-    block.loops=block.loops+1
-    source_block.min_loop_target = math.min(target_id,block.min_loop_target)
 
-    print("GOOD")
-    return true
-end
+    -- build loops - finally
+    local block_addr = func_entry
+    while block_addr ~= nil do
+        local block = blocks[block_addr]
 
--- build loops - finally
-local block_addr = func_entry
-while block_addr ~= nil do
-    local block = blocks[block_addr]
+        for i=1,#block do
+            local instr = block[i]
+            if instr.jmp_addr then
+                local target_id = blocks[instr.jmp_addr].base_id
 
-    for i=1,#block do
-        local instr = block[i]
-        if instr.jmp_addr then
-            local target_id = blocks[instr.jmp_addr].base_id
-
-            if instr.id >= target_id and check_can_loop(block,instr.id,target_id) then
-                instr.loop=true
-            else
-                blocks[instr.jmp_addr].needs_label=true
+                if instr.id >= target_id and check_can_loop(block,instr.id,target_id) then
+                    instr.loop=true
+                else
+                    blocks[instr.jmp_addr].needs_label=true
+                end
             end
         end
+
+        block_addr=block.next
     end
 
-    block_addr=block.next
+    print("\nBLOCKS:")
+    PrintTable(blocks)
+
+    -- codegen
+    local code_lines={
+        "return function(cpu)",
+            "local yeild=cpu.yeild",
+            "local call=cpu.call",
+            "local int=cpu.int",
+            "local status=cpu.status",
+            "local r8=cpu.r8",
+            "local r16=cpu.r16",
+            "local data8=cpu.data8",
+            "local data16=cpu.data16",
+            "local stack8=cpu.stack8",
+            "local stack16=cpu.stack16"
+            --todo cache all locals from cpu
+    }
+
+    local block_addr = func_entry
+    while block_addr ~= nil do
+        local block = blocks[block_addr]
+
+        if block.needs_label then
+            table.insert(code_lines,string.format("::L%x::",block_addr))
+        end
+
+        --print(block.loops)
+        for i=1,block.loops do
+            table.insert(code_lines,"repeat")
+        end
+
+        for i=1,#block do
+            local instr = block[i]
+            if instr.code then
+                table.insert(code_lines,instr.code)
+            end
+            if instr.loop then
+                if instr.jmp_cond then
+                    table.insert(code_lines,"until not ("..instr.jmp_cond..") or yeild()")
+                else
+                    table.insert(code_lines,"until yeild()")
+                end
+            elseif instr.jmp_addr then
+                local target_id = blocks[instr.jmp_addr].base_id
+
+                if instr.id >= target_id then
+                    -- back jump, insert yeild
+                    if instr.jmp_cond then
+                        table.insert(code_lines,string.format("if %s then yeild() ; goto L%x end",instr.jmp_cond,instr.jmp_addr))
+                    else
+                        table.insert(code_lines,string.format("yeild() ; goto L%x",instr.jmp_addr))
+                    end
+                else
+                    if instr.jmp_cond then
+                        table.insert(code_lines,string.format("if %s then goto L%x end",instr.jmp_cond,instr.jmp_addr))
+                    else
+                        table.insert(code_lines,string.format("goto L%x",instr.jmp_addr))
+                    end
+                end
+
+            end
+        end
+
+        block_addr=block.next
+    end
+
+    table.insert(code_lines,"end")
+
+    local code_str = table.concat(code_lines,"\n")
+
+    file.Write(string.format("glua86/code_%x.txt",func_entry), code_str)
+
+    local code_f = CompileString(code_str, "glua86")()
+    return code_f
 end
 
-print("\nBLOCKS:")
-PrintTable(blocks)
-
--- codegen
-local code_lines={
-    "return function(cpu)",
-        "local call=cpu.call",
-        "local int=cpu.int",
-        "local status=cpu.status",
-        "local r8=cpu.r8",
-        "local r16=cpu.r16",
-        "local data8=cpu.data8",
-        "local data16=cpu.data16",
-        "local stack8=cpu.stack8",
-        "local stack16=cpu.stack16",
-        "--todo cache all locals from cpu"
-}
-
-local block_addr = func_entry
-while block_addr ~= nil do
-    local block = blocks[block_addr]
-
-    if block.needs_label then
-        table.insert(code_lines,string.format("::L%x::",block_addr))
-    end
-
-    print(block.loops)
-    for i=1,block.loops do
-        table.insert(code_lines,"repeat")
-    end
-
-    for i=1,#block do
-        local instr = block[i]
-        if instr.code then
-            table.insert(code_lines,instr.code)
-        end
-        if instr.loop then
-            if instr.jmp_cond then
-                table.insert(code_lines,"until not "..instr.jmp_cond)
-            else
-                table.insert(code_lines,"until false")
-            end
-        elseif instr.jmp_addr then
-            if instr.jmp_cond then
-                table.insert(code_lines,string.format("if %s then goto L%x end",instr.jmp_cond,instr.jmp_addr))
-            else
-                table.insert(code_lines,string.format("goto L%x",instr.jmp_addr))
-            end
-        end
-    end
-
-    block_addr=block.next
+local function run_code(func_entry)
+    local compiled_f = compile_func(func_entry)
+    compiled_f()
 end
 
-table.insert(code_lines,"end")
-
-local code_str = table.concat(code_lines,"\n")
-
-print(code_str)
-file.Write("glua86/code.txt", code_str)
-
-local code_f = CompileString(code_str, "glua86")()
+run_code(0x7C00)
